@@ -15,10 +15,10 @@ use App\Http\Controllers\AIAgentController;
 |
 */
 
-Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
+/*Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
     return $request->user();
-});
+});*/
 
 Route::get('/ai-agent/test', [AIAgentController::class, 'test']);
-// Rute untuk berinteraksi dengan AI Agent suara
+
 Route::post('/ai-agent/speak', [AIAgentController::class, 'speak']);
