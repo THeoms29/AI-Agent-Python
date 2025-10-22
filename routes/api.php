@@ -19,6 +19,7 @@ use App\Http\Controllers\AIAgentController;
     return $request->user();
 });*/
 
-Route::get('/ai-agent/test', [AIAgentController::class, 'test']);
-
-Route::post('/ai-agent/speak', [AIAgentController::class, 'speak']);
+Route::post('/ai-agent/recognize', [AIAgentController::class, 'recognizeAudio']);
+Route::post('/ai-agent/agent', [AIAgentController::class, 'agentConverse']);
+Route::post('/ai-agent/tts', [AIAgentController::class, 'ttsViaPhp']);
+Route::post('/ai-agent/converse', [AIAgentController::class, 'converseFull']);
