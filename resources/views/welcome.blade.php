@@ -115,8 +115,8 @@
             statusDiv.textContent = 'Agen sedang berpikir...';
 
             try {
-                const response = await axios.post('/api/ai-agent/speak', {
-                    message: message
+                const response = await axios.post('/api/ai-agent/converse', {
+                    Text : message
                 });
 
                 const data = response.data;
