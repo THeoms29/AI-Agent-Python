@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import traceback
+import requests
 
 # Untuk Windows event loop
 import platform
@@ -20,7 +21,12 @@ API_KEY = os.getenv("ELEVENLABS_API_KEY")
 VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID")
 AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID")
 
-# Import SDK
+"""
+Catatan:
+- Kita tetap gunakan SDK ElevenLabs untuk TTS streaming saja (stabil).
+- Untuk Agents, kita panggil endpoint HTTP simulate-conversation langsung,
+  karena skema SDK bervariasi antar versi.
+"""
 try:
     from elevenlabs.client import ElevenLabs
     from elevenlabs.core.api_error import ApiError
@@ -28,42 +34,141 @@ except ImportError:
     ElevenLabs = None
     ApiError = Exception
 
+def _extract_agent_text(resp_json: dict) -> str:
+    """Ambil teks balasan dari berbagai bentuk response ElevenLabs."""
+    if not isinstance(resp_json, dict):
+        return ""
+    # Structured messages
+    messages = resp_json.get("messages")
+    if isinstance(messages, list):
+        for m in reversed(messages):
+            role = (m or {}).get("role")
+            if role in ("assistant", "agent", "system", "bot"):
+                # vektor kemungkinan: content -> list of blocks / text field
+                content = (m or {}).get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") in ("output_text", "text"):
+                            txt = block.get("text")
+                            if txt:
+                                return txt
+                # fallback sederhana
+                if isinstance(content, str) and content:
+                    return content
+                txt = (m or {}).get("text")
+                if txt:
+                    return txt
+    # Flat fields
+    for key in ("response", "text", "message"):
+        if isinstance(resp_json.get(key), str):
+            return resp_json[key]
+    return ""
+
+
+def _simulate_conversation_http(text: str) -> dict:
+    """Panggil ElevenLabs Agents simulate-conversation dengan 2 format payload."""
+    if not API_KEY:
+        return {"success": False, "error": "Missing ELEVENLABS_API_KEY"}
+    if not AGENT_ID:
+        return {"success": False, "error": "Missing ELEVENLABS_AGENT_ID"}
+
+    base_url = "https://api.elevenlabs.io"
+    url = f"{base_url}/v1/convai/agents/{AGENT_ID}/simulate-conversation"
+    headers = {
+        "xi-api-key": API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    # Attempt 1: Format dengan simulation_specification dan messages
+    payload1 = {
+        "simulation_specification": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": text}
+                    ]
+                }
+            ]
+        }
+    }
+    r = requests.post(url, headers=headers, json=payload1, timeout=60)
+    if r.status_code < 400:
+        data = r.json()
+        agent_text = _extract_agent_text(data)
+        return {"success": True, "text": agent_text, "raw": data}
+
+    # Attempt 2: Format dengan simulation_specification dan simulated_user_config
+    payload2 = {
+        "simulation_specification": {
+            "simulated_user_config": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": text}
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+    r2 = requests.post(url, headers=headers, json=payload2, timeout=60)
+    if r2.status_code < 400:
+        data = r2.json()
+        agent_text = _extract_agent_text(data)
+        return {"success": True, "text": agent_text, "raw": data}
+
+    # Attempt 3: Format dengan simulation_specification kosong dan messages di root
+    payload3 = {
+        "simulation_specification": {
+            "simulated_user_config": {}
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": text}
+                ]
+            }
+        ]
+    }
+    r3 = requests.post(url, headers=headers, json=payload3, timeout=60)
+    if r3.status_code < 400:
+        data = r3.json()
+        agent_text = _extract_agent_text(data)
+        return {"success": True, "text": agent_text, "raw": data}
+
+    # Kegagalan, kembalikan detail dari attempt terakhir
+    try:
+        err_json = r3.json()
+    except Exception:
+        err_json = r3.text
+    return {
+        "success": False,
+        "error": "agent_client_error",
+        "status_code": r3.status_code,
+        "details": err_json,
+    }
+
+
 def get_agent_response(text):
     if not API_KEY:
         return {"success": False, "error": "Missing ELEVENLABS_API_KEY"}
     client = ElevenLabs(api_key=API_KEY)
 
-    # Jika AGENT_ID tersedia, coba Agent API
+    # Jika AGENT_ID tersedia, gunakan HTTP simulate-conversation
     if AGENT_ID:
-        try:
-            # adaptasi versi SDK yang berbeda
-            conv = None
-            if hasattr(client, "agents"):
-                conv = client.agents.get(AGENT_ID)
-            elif hasattr(client, "conversational_ai"):
-                conv = client.conversational_ai.create(agent_id=AGENT_ID)
-            else:
-                raise Exception("Agent API client not supported")
-
-            # Kirim user message
-            response = conv.send_message(text=text)
-            # Ambil audio atau teks
-            audio_path = None
-            if hasattr(response, "audio"):
-                audio_data = response.audio
-                fn = f"agent_{os.urandom(8).hex()}.mp3"
-                fp = os.path.join("temp_audio", fn)
-                with open(fp, "wb") as f:
-                    f.write(audio_data)
-                audio_path = fp
-
-            return {"success": True, "response_text": getattr(response, "text", ""), "audio_path": audio_path, "method": "agent"}
-
-        except ApiError as e:
-            # jika API agent gagal, fallback ke TTS
-            return {"success": False, "error": "Agent API error", "details": str(e)}
-        except Exception as e:
-            return {"success": False, "error": "Agent logic error", "details": str(e)}
+        agent_res = _simulate_conversation_http(text)
+        if agent_res.get("success"):
+            return {
+                "success": True,
+                "response_text": agent_res.get("text", ""),
+                "audio_path": None,
+                "method": "agent"
+            }
+        # Jika gagal, teruskan detail agar UI bisa menampilkan alasannya, lalu fallback ke TTS
+        agent_error = agent_res
 
     # Fallback ke TTS
     try:
@@ -89,9 +194,16 @@ def get_agent_response(text):
         return {"success": True, "response_text": text, "audio_path": fp, "method": "tts"}
 
     except ApiError as e:
-        return {"success": False, "error": "TTS API error", "details": str(e)}
-    except Exception as e:
-        return {"success": False, "error": "Unknown error", "traceback": traceback.format_exc()}
+        # Sertakan error agent (jika ada) untuk konteks
+        out = {"success": False, "error": "TTS API error", "details": str(e)}
+        if 'agent_error' in locals():
+            out["agent_fallback_details"] = agent_error
+        return out
+    except Exception:
+        out = {"success": False, "error": "Unknown error", "traceback": traceback.format_exc()}
+        if 'agent_error' in locals():
+            out["agent_fallback_details"] = agent_error
+        return out
 
 def main():
     if len(sys.argv) < 2:

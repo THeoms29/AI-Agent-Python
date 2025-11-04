@@ -95,36 +95,134 @@ class AIAgentController extends Controller
         $request->validate(['text' => 'required|string']);
         $text = $request->input('text');
 
+        $apiKey = env('ELEVENLABS_API_KEY');
         $agentId = env('ELEVENLABS_AGENT_ID');
+        
+        if (!$apiKey) {
+            Log::error('Missing ELEVENLABS_API_KEY');
+            return response()->json(['success' => false, 'error' => 'Missing ELEVENLABS_API_KEY', 'message' => 'API Key ElevenLabs tidak diatur di file .env'], 500);
+        }
+        
         if (!$agentId) {
-            return response()->json(['success' => false, 'error' => 'Missing ELEVENLABS_AGENT_ID'], 500);
+            Log::error('Missing ELEVENLABS_AGENT_ID');
+            return response()->json(['success' => false, 'error' => 'Missing ELEVENLABS_AGENT_ID', 'message' => 'Agent ID ElevenLabs tidak diatur di file .env'], 500);
         }
 
         $client = new Client(['base_uri' => 'https://api.elevenlabs.io', 'timeout' => 60]);
 
         try {
-            $payload = [
-                'messages' => [
-                    ['role' => 'user', 'content' => $text]
+            $headers = [
+                'xi-api-key' => $apiKey,
+                'Content-Type' => 'application/json'
+            ];
+
+            // Attempt 1: Format dengan simulation_specification dan messages
+            $payload1 = [
+                'simulation_specification' => [
+                    'messages' => [
+                        [
+                            'role' => 'user',
+                            'content' => [
+                                ['type' => 'input_text', 'text' => $text]
+                            ]
+                        ]
+                    ]
                 ]
             ];
 
-            $resp = $client->post("/v1/convai/agents/{$agentId}/simulate-conversation", [
-                'headers' => [
-                    'xi-api-key' => env('ELEVENLABS_API_KEY'),
-                    'Content-Type' => 'application/json'
-                ],
-                'json' => $payload
-            ]);
+            try {
+                Log::info('Attempting payload 1: ' . json_encode($payload1));
+                $resp = $client->post("/v1/convai/agents/{$agentId}/simulate-conversation", [
+                    'headers' => $headers,
+                    'json' => $payload1
+                ]);
+            } catch (\GuzzleHttp\Exception\ClientException $e1) {
+                Log::warning('Payload 1 failed, trying payload 2');
+                // Attempt 2: Format dengan simulation_specification dan simulated_user_config
+                $payload2 = [
+                    'simulation_specification' => [
+                        'simulated_user_config' => [
+                            'messages' => [
+                                [
+                                    'role' => 'user',
+                                    'content' => [
+                                        ['type' => 'input_text', 'text' => $text]
+                                    ]
+                                ]
+                            ]
+                        ]
+                    ]
+                ];
+
+                try {
+                    Log::info('Attempting payload 2: ' . json_encode($payload2));
+                    $resp = $client->post("/v1/convai/agents/{$agentId}/simulate-conversation", [
+                        'headers' => $headers,
+                        'json' => $payload2
+                    ]);
+                } catch (\GuzzleHttp\Exception\ClientException $e2) {
+                    Log::warning('Payload 2 failed, trying payload 3');
+                    // Attempt 3: Format sederhana dengan simulation_specification kosong
+                    $payload3 = [
+                        'simulation_specification' => [
+                            'simulated_user_config' => []
+                        ],
+                        'messages' => [
+                            [
+                                'role' => 'user',
+                                'content' => [
+                                    ['type' => 'input_text', 'text' => $text]
+                                ]
+                            ]
+                        ]
+                    ];
+
+                    Log::info('Attempting payload 3: ' . json_encode($payload3));
+                    $resp = $client->post("/v1/convai/agents/{$agentId}/simulate-conversation", [
+                        'headers' => $headers,
+                        'json' => $payload3
+                    ]);
+                }
+            }
 
             $j = json_decode((string)$resp->getBody(), true);
+            Log::info('Agent response received: ' . json_encode($j));
 
             // Heuristic to extract agent text
             $agentText = null;
+            $conversation = null;
             if (isset($j['messages']) && is_array($j['messages'])) {
-                foreach (array_reverse($j['messages']) as $m) {
+                $conversation = $j['messages'];
+            } elseif (isset($j['simulated_conversation']) && is_array($j['simulated_conversation'])) {
+                $conversation = $j['simulated_conversation'];
+            }
+
+            if ($conversation) {
+                foreach (array_reverse($conversation) as $m) {
                     if (in_array($m['role'] ?? '', ['assistant', 'agent', 'system', 'bot'])) {
-                        $agentText = $m['content'] ?? ($m['text'] ?? $agentText);
+                        // Prefer explicit 'message' field if present
+                        if (isset($m['message']) && is_string($m['message'])) {
+                            $agentText = $m['message'];
+                            break;
+                        }
+
+                        $content = $m['content'] ?? ($m['text'] ?? null);
+                        
+                        // Handle content as array (structured content)
+                        if (is_array($content)) {
+                            foreach ($content as $block) {
+                                if (is_array($block) && isset($block['text'])) {
+                                    $agentText = $block['text'];
+                                    break;
+                                } elseif (is_string($block) && trim($block) !== '') {
+                                    $agentText = $block;
+                                    break;
+                                }
+                            }
+                        } elseif (is_string($content) && trim($content) !== '') {
+                            $agentText = $content;
+                        }
+                        
                         if ($agentText) break;
                     }
                 }
@@ -133,14 +231,57 @@ class AIAgentController extends Controller
                 $agentText = $j['response'] ?? $j['text'] ?? json_encode($j);
             }
 
-            return response()->json(['success' => true, 'text' => $agentText, 'raw' => $j]);
+            // Clean up: remove any JSON encoding artifacts
+            if (is_string($agentText) && (strpos($agentText, '{') === 0 || strpos($agentText, '[') === 0)) {
+                $decoded = json_decode($agentText, true);
+                if ($decoded !== null) {
+                    $agentText = is_array($decoded) ? json_encode($decoded) : $decoded;
+                }
+            }
+
+            Log::info('Extracted agent text length: ' . strlen($agentText ?? ''));
+            // Return short display text by default (UI-friendly)
+            $MAX_DISPLAY = 500;
+            $displayText = $agentText;
+            $wasTruncated = false;
+            if (is_string($displayText) && strlen($displayText) > $MAX_DISPLAY) {
+                $displayText = substr($displayText, 0, $MAX_DISPLAY - 3) . '...';
+                $wasTruncated = true;
+            }
+            return response()->json(['success' => true, 'text' => $displayText, 'raw' => $j, 'full_text_truncated' => $wasTruncated]);
         } catch (\GuzzleHttp\Exception\ClientException $e) {
-            $body = (string)$e->getResponse()->getBody();
-            Log::error('Agent client exception: ' . $body);
-            return response()->json(['success' => false, 'error' => 'agent_client_error', 'details' => json_decode($body, true) ?: $body], 400);
+            $response = $e->getResponse();
+            $statusCode = $response ? $response->getStatusCode() : 0;
+            $body = $response ? (string)$response->getBody() : '';
+            
+            $errorData = json_decode($body, true);
+            $errorMessage = 'Error dari ElevenLabs API';
+            
+            if ($errorData && isset($errorData['detail'])) {
+                $errorMessage = $errorData['detail']['message'] ?? $errorData['detail'] ?? $errorMessage;
+            } elseif ($errorData && isset($errorData['message'])) {
+                $errorMessage = $errorData['message'];
+            } elseif ($errorData && isset($errorData['error'])) {
+                $errorMessage = $errorData['error']['message'] ?? $errorData['error'] ?? $errorMessage;
+            }
+            
+            Log::error('Agent client exception [Status: ' . $statusCode . ']: ' . $body);
+            
+            return response()->json([
+                'success' => false, 
+                'error' => 'agent_client_error',
+                'message' => $errorMessage,
+                'status_code' => $statusCode,
+                'details' => $errorData ?: $body
+            ], 400);
         } catch (\Exception $e) {
             Log::error('Agent HTTP error: ' . $e->getMessage());
-            return response()->json(['success' => false, 'error' => 'agent_error', 'details' => $e->getMessage()], 500);
+            return response()->json([
+                'success' => false, 
+                'error' => 'agent_error', 
+                'message' => $e->getMessage(),
+                'details' => $e->getMessage()
+            ], 500);
         }
     }
 
@@ -149,6 +290,17 @@ class AIAgentController extends Controller
     {
         $request->validate(['text' => 'required|string']);
         $text = $request->input('text');
+        
+        // ElevenLabs TTS limit: 10000 characters
+        $MAX_CHARS = 10000;
+        $textLength = mb_strlen($text);
+        
+        // If text is too long, truncate it with a note
+        if ($textLength > $MAX_CHARS) {
+            Log::warning("Text too long for TTS ({$textLength} chars), truncating to {$MAX_CHARS} chars");
+            $text = mb_substr($text, 0, $MAX_CHARS - 50) . '... [Teks dipotong karena terlalu panjang untuk audio]';
+            $textLength = mb_strlen($text);
+        }
 
         $voiceId = env('ELEVENLABS_VOICE_ID');
         if (!$voiceId) {
@@ -215,10 +367,37 @@ class AIAgentController extends Controller
         if (!$agentJson['success']) {
             return $agentResp;
         }
+        // Use the short display text from agentConverse, but prefer full text if not truncated
         $agentText = $agentJson['text'];
 
-        // TTS
-        $ttsResp = $this->ttsViaPhp(new Request(['text' => $agentText]));
-        return $ttsResp;
+        // TTS - dengan handling untuk teks panjang dan batasi teks yang dibacakan
+        $MAX_SPOKEN = 800; // sekitar beberapa kalimat
+        $spokenText = is_string($agentText) && mb_strlen($agentText) > $MAX_SPOKEN
+            ? (mb_substr($agentText, 0, $MAX_SPOKEN - 3) . '...')
+            : $agentText;
+        $ttsResp = $this->ttsViaPhp(new Request(['text' => $spokenText]));
+        $ttsJson = json_decode($ttsResp->getContent(), true);
+        
+        // Combine response: selalu include agent text, audio optional
+        if ($ttsJson && $ttsJson['success']) {
+            return response()->json([
+                'success' => true,
+                'response_text' => $spokenText,
+                'audio_url' => $ttsJson['audio_url'],
+                'path' => $ttsJson['path'] ?? null,
+                'text_truncated' => mb_strlen($agentText) > $MAX_SPOKEN
+            ]);
+        } else {
+            // Jika TTS gagal (misal karena terlalu panjang), tetap kembalikan teks
+            Log::warning('TTS failed but returning text response: ' . ($ttsJson['error'] ?? 'Unknown error'));
+            return response()->json([
+                'success' => true,
+                'response_text' => $spokenText,
+                'audio_url' => null,
+                'tts_error' => $ttsJson['error'] ?? 'TTS generation failed',
+                'text_truncated' => mb_strlen($agentText) > $MAX_SPOKEN,
+                'message' => 'Audio tidak dapat dibuat karena teks terlalu panjang. Teks tetap ditampilkan.'
+            ]);
+        }
     }
 }
